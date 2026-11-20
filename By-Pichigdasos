@@ -1,0 +1,2188 @@
+local env = (type(getgenv) == "function" and getgenv()) or _G
+env.FluxHubCTD = env.FluxHubCTD or {}
+local Shared = env.FluxHubCTD
+
+if type(Shared.destroy) == "function" then
+    pcall(Shared.destroy)
+end
+Shared.destroy = nil
+Shared.handler = nil
+
+local Players = game:GetService("Players")
+local HttpService = game:GetService("HttpService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local GuiService = game:GetService("GuiService")
+local VirtualUser = game:GetService("VirtualUser")
+
+local VirtualInputManager = nil
+pcall(function()
+    VirtualInputManager = game:GetService("VirtualInputManager")
+end)
+
+if not game:IsLoaded() then
+    game.Loaded:Wait()
+end
+
+local LocalPlayer = Players.LocalPlayer
+while not LocalPlayer do
+    task.wait()
+    LocalPlayer = Players.LocalPlayer
+end
+
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+local Alive = true
+local Connections = {}
+
+local function connect(signal, callback)
+    local connection = signal:Connect(callback)
+    table.insert(Connections, connection)
+    return connection
+end
+
+local Config = {
+    Name = "Flux Hub - CTD",
+    Folder = "FluxHub_CTD",
+    LobbyPlaceId = 132929771812494,
+    NoMacros = "No Macros",
+    ScanInterval = 0.75,
+    MinActionGap = 0.25,
+    TowerMatchRadius = 8,
+    PlaceVerifyRadius = 6,
+    PlaceRetries = 12,
+    PlaceRetryDelay = 1.25,
+    PlaceConfirmTime = 1.4,
+    ResolveTimeout = 4,
+    Difficulties = {"Easy", "Normal", "Hard", "Nightmare (Insane)"},
+    DifficultyAliases = {
+        ["Easy"] = {"easy"},
+        ["Normal"] = {"normal", "medium"},
+        ["Hard"] = {"hard"},
+        ["Nightmare (Insane)"] = {"nightmare", "insane"},
+    },
+    EndTitles = {
+        "victory", "defeat", "game over", "you win", "you won", "you lose", "you lost",
+        "mission complete", "mission failed", "stage clear", "stage cleared", "play again",
+    },
+    KnownNames = {
+        place = {"toweradd"},
+        upgrade = {"towerupgrade"},
+        sell = {"towersell"},
+    },
+    Patterns = {
+        place = {"toweradd", "towerplace", "placetower", "placeunit", "unitplace", "troopplace", "placetroop", "addtower", "deploytower", "deployunit"},
+        upgrade = {"towerupgrade", "upgradetower", "upgradeunit", "unitupgrade", "troopupgrade", "upgradetroop", "upgrade"},
+        sell = {"towersell", "selltower", "sellunit", "unitsell", "troopsell", "selltroop", "sell"},
+    },
+    ScopeWords = {"tower", "troop", "unit", "deploy", "cameraman"},
+    ActionWords = {
+        place = {"place", "add", "spawn", "summon", "deploy"},
+        upgrade = {"upgrade", "levelup"},
+        sell = {"sell", "remove", "delete"},
+    },
+}
+
+local Paths = {
+    root = Config.Folder,
+    macros = Config.Folder .. "/Macros",
+    settings = Config.Folder .. "/Settings.json",
+    pending = Config.Folder .. "/Pending.json",
+}
+
+local Debug = {lines = {}, verbose = false, logRemotes = false}
+local Storage = {mem = {}}
+local Settings = {}
+local State = {}
+local Util = {}
+local Serializer = {}
+local Remotes = {}
+local Classify = {}
+local Extract = {}
+local Towers = {}
+local Macros = {}
+local Recorder = {actions = {}, places = {}, recent = {}, t0 = 0}
+local Player = {running = false, token = 0, firing = false, name = nil, progress = 0, total = 0}
+local GuiWatch = {texts = setmetatable({}, {__mode = "k"})}
+local GuiTools = {}
+local Vote = {}
+local Detect = {}
+local Automation = {}
+local UI = {cache = {}}
+local Hook = {available = false}
+local UNRESOLVED = {}
+
+function Debug.log(...)
+    local parts = {}
+    for i = 1, select("#", ...) do
+        parts[#parts + 1] = tostring((select(i, ...)))
+    end
+    local line = string.format("[%s] %s", os.date("%H:%M:%S"), table.concat(parts, " "))
+    table.insert(Debug.lines, line)
+    if #Debug.lines > 300 then
+        table.remove(Debug.lines, 1)
+    end
+    if Debug.verbose then
+        warn("[Flux Hub - CTD] " .. line)
+    end
+end
+
+local function jsonEncode(value)
+    local ok, result = pcall(function()
+        return HttpService:JSONEncode(value)
+    end)
+    if ok then
+        return result
+    end
+    Debug.log("JSON encode failed", result)
+    return nil
+end
+
+local function jsonDecode(text)
+    local ok, result = pcall(function()
+        return HttpService:JSONDecode(text)
+    end)
+    if ok then
+        return result
+    end
+    return nil
+end
+
+Storage.persistent = type(writefile) == "function"
+    and type(readfile) == "function"
+    and type(isfile) == "function"
+    and type(isfolder) == "function"
+    and type(makefolder) == "function"
+
+function Storage.ensureFolder(path)
+    if not Storage.persistent then
+        return
+    end
+    local ok, exists = pcall(isfolder, path)
+    if ok and not exists then
+        pcall(makefolder, path)
+    end
+end
+
+function Storage.write(path, text)
+    Storage.mem[path] = text
+    if Storage.persistent then
+        local ok = pcall(writefile, path, text)
+        return ok
+    end
+    return true
+end
+
+function Storage.read(path)
+    if Storage.persistent then
+        local okExists, exists = pcall(isfile, path)
+        if okExists and exists then
+            local ok, data = pcall(readfile, path)
+            if ok and type(data) == "string" then
+                return data
+            end
+        end
+    end
+    return Storage.mem[path]
+end
+
+function Storage.remove(path)
+    Storage.mem[path] = nil
+    if Storage.persistent and type(delfile) == "function" then
+        pcall(delfile, path)
+    end
+end
+
+function Storage.list(dir)
+    local seen = {}
+    local names = {}
+    local function add(name)
+        if name and not seen[name] then
+            seen[name] = true
+            table.insert(names, name)
+        end
+    end
+    if Storage.persistent and type(listfiles) == "function" then
+        local ok, files = pcall(listfiles, dir)
+        if ok and type(files) == "table" then
+            for _, file in ipairs(files) do
+                add(tostring(file):match("([^/\\]+)%.json$"))
+            end
+        end
+    end
+    local prefix = dir .. "/"
+    for path in pairs(Storage.mem) do
+        if path:sub(1, #prefix) == prefix then
+            add(path:sub(#prefix + 1):match("^(.+)%.json$"))
+        end
+    end
+    return names
+end
+
+Settings.data = {
+    autoVote = false,
+    difficulty = "Easy",
+    autoReplay = false,
+    autoSkip = false,
+    playMacro = false,
+    antiAfk = true,
+    selectedMacro = "",
+    recordArmed = false,
+    overrides = {place = "", upgrade = "", sell = ""},
+}
+
+function Settings.load()
+    local raw = Storage.read(Paths.settings)
+    if not raw then
+        return
+    end
+    local decoded = jsonDecode(raw)
+    if type(decoded) ~= "table" then
+        return
+    end
+    for key, value in pairs(decoded) do
+        if key == "overrides" then
+            if type(value) == "table" then
+                for kind, name in pairs(value) do
+                    Settings.data.overrides[kind] = tostring(name)
+                end
+            end
+        else
+            Settings.data[key] = value
+        end
+    end
+    local valid = false
+    for _, name in ipairs(Config.Difficulties) do
+        if name == Settings.data.difficulty then
+            valid = true
+        end
+    end
+    if not valid then
+        Settings.data.difficulty = "Easy"
+    end
+end
+
+function Settings.save()
+    local text = jsonEncode(Settings.data)
+    if text then
+        Storage.write(Paths.settings, text)
+    end
+end
+
+State.InMatch = false
+State.Wave = 0
+State.MatchStart = os.clock()
+State.EndVisible = false
+State.SawMatch = false
+State.RoundEnded = false
+State.Voted = false
+State.VoteAttemptAt = 0
+State.VoteGoneSince = nil
+State.ReplayPressed = false
+State.EndShownSince = nil
+State.EndClearSince = nil
+State.LastMatchSeen = 0
+State.PlayedThisMatch = false
+State.LastSkip = 0
+State.Armed = false
+State.Recording = false
+State.Pending = nil
+
+function Util.clean(text)
+    if type(text) ~= "string" then
+        return ""
+    end
+    local s = text:gsub("<[^>]*>", "")
+    s = s:lower()
+    s = s:gsub("^%s+", "")
+    s = s:gsub("%s+$", "")
+    return s
+end
+
+function Util.cleanName(text)
+    local s = tostring(text or "")
+    s = s:gsub("[^%w _%-]", "")
+    s = s:gsub("^%s+", "")
+    s = s:gsub("%s+$", "")
+    if #s > 40 then
+        s = s:sub(1, 40)
+    end
+    return s
+end
+
+function Util.guiVisible(obj)
+    local current = obj
+    while current and current ~= PlayerGui do
+        if current:IsA("GuiObject") then
+            if not current.Visible then
+                return false
+            end
+        elseif current:IsA("ScreenGui") then
+            if not current.Enabled then
+                return false
+            end
+        end
+        current = current.Parent
+    end
+    return current == PlayerGui
+end
+
+function Util.pathOf(inst)
+    if typeof(inst) ~= "Instance" then
+        return nil
+    end
+    local segments = {}
+    local current = inst
+    while current and current ~= game do
+        table.insert(segments, 1, current.Name)
+        current = current.Parent
+    end
+    if current ~= game then
+        return nil
+    end
+    return segments
+end
+
+function Util.resolvePath(segments)
+    if type(segments) ~= "table" then
+        return nil
+    end
+    local current = game
+    for _, name in ipairs(segments) do
+        local nextInstance = current:FindFirstChild(name)
+        if not nextInstance and current == game then
+            local ok, service = pcall(function()
+                return game:GetService(name)
+            end)
+            if ok then
+                nextInstance = service
+            end
+        end
+        if not nextInstance then
+            return nil
+        end
+        current = nextInstance
+    end
+    return current
+end
+
+function Util.pivot(inst)
+    if typeof(inst) ~= "Instance" then
+        return nil
+    end
+    if inst:IsA("PVInstance") then
+        local ok, cframe = pcall(function()
+            return inst:GetPivot()
+        end)
+        if ok and cframe then
+            return cframe.Position
+        end
+    end
+    return nil
+end
+
+function Util.flat(a, b)
+    return Vector3.new(a.X - b.X, 0, a.Z - b.Z).Magnitude
+end
+
+function Util.describe(value)
+    local kind = typeof(value)
+    if kind == "Vector3" then
+        return string.format("(%.1f, %.1f, %.1f)", value.X, value.Y, value.Z)
+    elseif kind == "CFrame" then
+        local p = value.Position
+        return string.format("CF(%.1f, %.1f, %.1f)", p.X, p.Y, p.Z)
+    elseif kind == "Instance" then
+        return value:GetFullName()
+    elseif kind == "table" then
+        return "{table}"
+    end
+    return tostring(value)
+end
+
+function Util.describeArgs(args)
+    local parts = {}
+    for i = 1, args.n do
+        parts[i] = Util.describe(args[i])
+    end
+    return table.concat(parts, ", ")
+end
+
+local function isArray(tbl)
+    local n = 0
+    for key in pairs(tbl) do
+        if type(key) ~= "number" or key < 1 or key % 1 ~= 0 then
+            return false, 0
+        end
+        if key > n then
+            n = key
+        end
+    end
+    for i = 1, n do
+        if tbl[i] == nil then
+            return false, 0
+        end
+    end
+    return true, n
+end
+
+function Serializer.pack(value, ctx, depth, seen)
+    local kind = typeof(value)
+    if kind == "nil" then
+        return {__t = "NIL"}
+    elseif kind == "boolean" or kind == "string" then
+        return value
+    elseif kind == "number" then
+        if value ~= value or value == math.huge or value == -math.huge then
+            return 0
+        end
+        return value
+    elseif kind == "Vector3" then
+        return {__t = "V3", x = value.X, y = value.Y, z = value.Z}
+    elseif kind == "Vector2" then
+        return {__t = "V2", x = value.X, y = value.Y}
+    elseif kind == "CFrame" then
+        return {__t = "CF", c = {value:GetComponents()}}
+    elseif kind == "Color3" then
+        return {__t = "C3", r = value.R, g = value.G, b = value.B}
+    elseif kind == "EnumItem" then
+        local enumName = tostring(value.EnumType):gsub("^Enum%.", "")
+        return {__t = "EN", e = enumName, n = value.Name}
+    elseif kind == "Instance" then
+        if value == LocalPlayer then
+            return {__t = "LP"}
+        end
+        if LocalPlayer.Character and value == LocalPlayer.Character then
+            return {__t = "LC"}
+        end
+        if ctx and ctx.towerRef then
+            local ref = ctx.towerRef(value)
+            if ref then
+                return ref
+            end
+        end
+        local path = Util.pathOf(value)
+        if path then
+            return {__t = "IN", p = path}
+        end
+        return {__t = "NIL"}
+    elseif kind == "table" then
+        if depth >= 6 or seen[value] then
+            return {__t = "NIL"}
+        end
+        seen[value] = true
+        local result
+        local array, count = isArray(value)
+        if array then
+            local items = {}
+            for i = 1, count do
+                items[i] = Serializer.pack(value[i], ctx, depth + 1, seen)
+            end
+            result = {__t = "AR", n = count, v = items}
+        else
+            local entries = {}
+            for key, item in pairs(value) do
+                local keyType = type(key)
+                if keyType == "string" or keyType == "number" then
+                    table.insert(entries, {
+                        Serializer.pack(key, ctx, depth + 1, seen),
+                        Serializer.pack(item, ctx, depth + 1, seen),
+                    })
+                end
+            end
+            result = {__t = "DT", e = entries}
+        end
+        seen[value] = nil
+        return result
+    end
+    return {__t = "NIL"}
+end
+
+function Serializer.unpack(value, ctx)
+    if type(value) ~= "table" then
+        return value
+    end
+    local tag = value.__t
+    if tag == "NIL" then
+        return nil
+    elseif tag == "V3" then
+        return Vector3.new(value.x, value.y, value.z)
+    elseif tag == "V2" then
+        return Vector2.new(value.x, value.y)
+    elseif tag == "CF" then
+        return CFrame.new(table.unpack(value.c))
+    elseif tag == "C3" then
+        return Color3.new(value.r, value.g, value.b)
+    elseif tag == "EN" then
+        local ok, item = pcall(function()
+            return Enum[value.e][value.n]
+        end)
+        if ok then
+            return item
+        end
+        return nil
+    elseif tag == "LP" then
+        return LocalPlayer
+    elseif tag == "LC" then
+        return LocalPlayer.Character
+    elseif tag == "IN" then
+        return Util.resolvePath(value.p)
+    elseif tag == "TW" then
+        if ctx and ctx.resolveTower then
+            local inst = ctx.resolveTower(value)
+            if inst then
+                return inst
+            end
+        end
+        return UNRESOLVED
+    elseif tag == "AR" then
+        local out = {}
+        local count = value.n or #value.v
+        for i = 1, count do
+            local item = Serializer.unpack(value.v[i], ctx)
+            if item == UNRESOLVED then
+                return UNRESOLVED
+            end
+            out[i] = item
+        end
+        return out
+    elseif tag == "DT" then
+        local out = {}
+        for _, pair in ipairs(value.e) do
+            local key = Serializer.unpack(pair[1], ctx)
+            local item = Serializer.unpack(pair[2], ctx)
+            if item == UNRESOLVED then
+                return UNRESOLVED
+            end
+            if key ~= nil then
+                out[key] = item
+            end
+        end
+        return out
+    end
+    return value
+end
+
+function Serializer.packArgs(args, ctx)
+    local items = {}
+    for i = 1, args.n do
+        items[i] = Serializer.pack(args[i], ctx, 0, {})
+    end
+    return {n = args.n, v = items}
+end
+
+function Serializer.unpackArgs(packed, ctx)
+    if type(packed) ~= "table" or type(packed.v) ~= "table" then
+        return nil
+    end
+    local out = {n = packed.n or #packed.v}
+    for i = 1, out.n do
+        local item = Serializer.unpack(packed.v[i], ctx)
+        if item == UNRESOLVED then
+            return nil
+        end
+        out[i] = item
+    end
+    return out
+end
+
+function Remotes.isRemote(inst)
+    return typeof(inst) == "Instance"
+        and (inst:IsA("RemoteEvent") or inst:IsA("RemoteFunction") or inst:IsA("UnreliableRemoteEvent"))
+end
+
+function Remotes.resolve(action)
+    if action.path then
+        local inst = Util.resolvePath(action.path)
+        if Remotes.isRemote(inst) then
+            return inst
+        end
+    end
+    for _, descendant in ipairs(ReplicatedStorage:GetDescendants()) do
+        if descendant.Name == action.remote and Remotes.isRemote(descendant) then
+            return descendant
+        end
+    end
+    return nil
+end
+
+function Remotes.list()
+    local out = {}
+    for _, descendant in ipairs(ReplicatedStorage:GetDescendants()) do
+        if Remotes.isRemote(descendant) then
+            table.insert(out, descendant.ClassName .. " : " .. descendant:GetFullName())
+        end
+    end
+    table.sort(out)
+    return out
+end
+
+function Classify.kind(remote, args)
+    local name = remote.Name:lower()
+    local overrides = Settings.data.overrides
+    for _, kind in ipairs({"place", "upgrade", "sell"}) do
+        local custom = overrides[kind]
+        if type(custom) == "string" and custom ~= "" and name == custom:lower() then
+            return kind
+        end
+    end
+    for _, kind in ipairs({"place", "upgrade", "sell"}) do
+        for _, known in ipairs(Config.KnownNames[kind]) do
+            if name == known then
+                return kind
+            end
+        end
+    end
+    for _, kind in ipairs({"upgrade", "sell", "place"}) do
+        for _, pattern in ipairs(Config.Patterns[kind]) do
+            if name:find(pattern, 1, true) then
+                return kind
+            end
+        end
+    end
+    local scoped = false
+    for _, word in ipairs(Config.ScopeWords) do
+        if name:find(word, 1, true) then
+            scoped = true
+        end
+    end
+    if scoped and type(args[1]) == "string" then
+        local first = args[1]:lower()
+        for kind, words in pairs(Config.ActionWords) do
+            for _, word in ipairs(words) do
+                if first == word then
+                    return kind
+                end
+            end
+        end
+    end
+    return nil
+end
+
+function Extract.findPosition(value, depth)
+    local kind = typeof(value)
+    if kind == "Vector3" then
+        return value
+    end
+    if kind == "CFrame" then
+        return value.Position
+    end
+    if kind == "table" and depth < 3 then
+        for _, item in pairs(value) do
+            local found = Extract.findPosition(item, depth + 1)
+            if found then
+                return found
+            end
+        end
+    end
+    return nil
+end
+
+function Extract.position(args)
+    for i = 1, args.n do
+        local found = Extract.findPosition(args[i], 0)
+        if found then
+            return found
+        end
+    end
+    return nil
+end
+
+function Extract.isActionWord(text)
+    local lower = text:lower()
+    for _, words in pairs(Config.ActionWords) do
+        for _, word in ipairs(words) do
+            if lower == word then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+function Extract.unit(args)
+    for i = 1, args.n do
+        local value = args[i]
+        if type(value) == "string" then
+            if not Extract.isActionWord(value) then
+                return value
+            end
+        elseif typeof(value) == "Instance" and value ~= LocalPlayer then
+            return value.Name
+        elseif type(value) == "table" then
+            for _, key in ipairs({"Name", "Unit", "Tower", "Troop", "Type"}) do
+                if type(value[key]) == "string" then
+                    return value[key]
+                end
+            end
+        end
+    end
+    return nil
+end
+
+function Towers.query(pos, radius)
+    local ok, parts = pcall(function()
+        local params = OverlapParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        local ignore = {}
+        if LocalPlayer.Character then
+            table.insert(ignore, LocalPlayer.Character)
+        end
+        params.FilterDescendantsInstances = ignore
+        return workspace:GetPartBoundsInRadius(pos, radius, params)
+    end)
+    if ok and type(parts) == "table" then
+        return parts
+    end
+    return {}
+end
+
+function Towers.snapshot(pos)
+    local set = {}
+    for _, part in ipairs(Towers.query(pos, Config.PlaceVerifyRadius)) do
+        set[part] = true
+    end
+    return set
+end
+
+function Towers.appeared(pos, before)
+    local now = Towers.snapshot(pos)
+    if next(before) == nil and next(now) == nil then
+        return nil
+    end
+    for part in pairs(now) do
+        if not before[part] then
+            return true
+        end
+    end
+    return false
+end
+
+function Towers.resolveRef(ctx, ref)
+    local cached = ctx.towers[ref.i]
+    if cached and cached.Parent then
+        return cached
+    end
+    local pos = ctx.positions[ref.i]
+    if not pos then
+        return nil
+    end
+    local best = nil
+    local bestDistance = Config.TowerMatchRadius
+    local function consider(inst)
+        if not inst or ctx.claimed[inst] then
+            return
+        end
+        if ref.cn and inst.ClassName ~= ref.cn then
+            return
+        end
+        local p = Util.pivot(inst)
+        if p then
+            local distance = Util.flat(p, pos)
+            if distance < bestDistance then
+                best = inst
+                bestDistance = distance
+            end
+        end
+    end
+    local container = nil
+    if ref.pp then
+        container = Util.resolvePath(ref.pp)
+    end
+    if container then
+        for _, child in ipairs(container:GetChildren()) do
+            consider(child)
+        end
+    end
+    if not best and ref.nm then
+        for _, part in ipairs(Towers.query(pos, Config.TowerMatchRadius)) do
+            local candidate = part:FindFirstAncestor(ref.nm)
+            if not candidate and part.Name == ref.nm then
+                candidate = part
+            end
+            consider(candidate)
+        end
+    end
+    if best then
+        ctx.towers[ref.i] = best
+        ctx.claimed[best] = ref.i
+        return best
+    end
+    return nil
+end
+
+function Macros.path(name)
+    return Paths.macros .. "/" .. name .. ".json"
+end
+
+function Macros.names()
+    local names = Storage.list(Paths.macros)
+    table.sort(names, function(a, b)
+        return a:lower() < b:lower()
+    end)
+    return names
+end
+
+function Macros.exists(name)
+    local lower = name:lower()
+    for _, existing in ipairs(Macros.names()) do
+        if existing:lower() == lower then
+            return true
+        end
+    end
+    return false
+end
+
+function Macros.create(name)
+    Storage.ensureFolder(Paths.root)
+    Storage.ensureFolder(Paths.macros)
+    local macro = {version = 1, name = name, created = os.time(), actions = {}}
+    return Storage.write(Macros.path(name), jsonEncode(macro) or "{}")
+end
+
+function Macros.load(name)
+    local raw = Storage.read(Macros.path(name))
+    if not raw then
+        return nil
+    end
+    local data = jsonDecode(raw)
+    if type(data) ~= "table" then
+        return nil
+    end
+    if type(data.actions) ~= "table" then
+        data.actions = {}
+    end
+    return data
+end
+
+function Macros.save(name, pending)
+    local macro = Macros.load(name) or {version = 1, name = name, created = os.time(), actions = {}}
+    macro.actions = pending.actions
+    macro.updated = os.time()
+    macro.placeId = pending.placeId
+    local text = jsonEncode(macro)
+    if not text then
+        return nil
+    end
+    Storage.ensureFolder(Paths.root)
+    Storage.ensureFolder(Paths.macros)
+    Storage.write(Macros.path(name), text)
+    return #macro.actions
+end
+
+function Macros.delete(name)
+    Storage.remove(Macros.path(name))
+end
+
+function Recorder.reset()
+    Recorder.actions = {}
+    Recorder.places = {}
+    Recorder.recent = {}
+end
+
+function Recorder.begin()
+    if State.Recording then
+        return
+    end
+    State.Recording = true
+    Recorder.t0 = State.MatchStart or os.clock()
+    Debug.log("Recording started")
+end
+
+function Recorder.arm()
+    Recorder.reset()
+    State.Armed = true
+    State.Recording = false
+    Settings.data.recordArmed = true
+    Settings.save()
+    if State.InMatch then
+        Recorder.begin()
+    end
+end
+
+function Recorder.disarm()
+    State.Armed = false
+    State.Recording = false
+    Settings.data.recordArmed = false
+    Settings.save()
+end
+
+function Recorder.refFor(inst)
+    local p = Util.pivot(inst)
+    if not p then
+        return nil
+    end
+    local bestIndex = nil
+    local bestDistance = Config.TowerMatchRadius
+    for i = #Recorder.places, 1, -1 do
+        local place = Recorder.places[i]
+        if place.pos and not place.sold then
+            local distance = Util.flat(p, place.pos)
+            if distance < bestDistance then
+                bestIndex = i
+                bestDistance = distance
+            end
+        end
+    end
+    if not bestIndex then
+        return nil
+    end
+    return {
+        __t = "TW",
+        i = bestIndex,
+        cn = inst.ClassName,
+        nm = inst.Name,
+        pp = Util.pathOf(inst.Parent),
+    }
+end
+
+function Recorder.remember(text)
+    table.insert(Recorder.recent, text)
+    while #Recorder.recent > 4 do
+        table.remove(Recorder.recent, 1)
+    end
+end
+
+function Recorder.capture(remote, method, args)
+    if not Remotes.isRemote(remote) then
+        return
+    end
+    local kind = Classify.kind(remote, args)
+    if Debug.logRemotes then
+        Debug.log("Remote", remote.Name, method, tostring(kind), Util.describeArgs(args))
+    end
+    if not State.Recording or not kind then
+        return
+    end
+    local entry = {
+        t = math.max(0, os.clock() - Recorder.t0),
+        kind = kind,
+        remote = remote.Name,
+        path = Util.pathOf(remote),
+        method = method,
+    }
+    local label = "Placed"
+    local unit = nil
+    local pos = nil
+    if kind == "place" then
+        pos = Extract.position(args)
+        unit = Extract.unit(args)
+        table.insert(Recorder.places, {pos = pos, unit = unit, sold = false})
+        entry.idx = #Recorder.places
+        entry.unit = unit
+        if pos then
+            entry.pos = {pos.X, pos.Y, pos.Z}
+        end
+        entry.args = Serializer.packArgs(args, nil)
+    else
+        local ctx = {}
+        ctx.towerRef = function(inst)
+            local ref = Recorder.refFor(inst)
+            if ref and not ctx.firstIndex then
+                ctx.firstIndex = ref.i
+            end
+            return ref
+        end
+        entry.args = Serializer.packArgs(args, ctx)
+        entry.idx = ctx.firstIndex
+        local place = ctx.firstIndex and Recorder.places[ctx.firstIndex] or nil
+        if place then
+            unit = place.unit
+            pos = place.pos
+            entry.unit = unit
+            if kind == "sell" then
+                place.sold = true
+            end
+        end
+        if kind == "upgrade" then
+            label = "Upgraded"
+        else
+            label = "Sold"
+        end
+    end
+    table.insert(Recorder.actions, entry)
+    local where = ""
+    if pos then
+        where = " " .. Util.describe(pos)
+    end
+    local text = string.format("%s %s%s", label, unit or "troop", where)
+    Recorder.remember(text)
+    Debug.log("Recorded", text)
+    UI.refreshStatus()
+end
+
+function Recorder.finish(reason)
+    local actions = Recorder.actions
+    Recorder.disarm()
+    UI.setRecordToggle(false)
+    local count = #actions
+    if reason == "round" then
+        warn("End Of Round: Ready")
+    end
+    if count == 0 then
+        if reason == "round" then
+            UI.notify("End Of Round: Ready", "No troop actions were recorded this round.", 6, "alert-triangle")
+        else
+            UI.notify("Recording Stopped", "No troop actions were recorded.", 4, "alert-triangle")
+        end
+        UI.refreshStatus()
+        return
+    end
+    State.Pending = {version = 1, placeId = game.PlaceId, recorded = os.time(), actions = actions}
+    local text = jsonEncode(State.Pending)
+    if text then
+        Storage.write(Paths.pending, text)
+    end
+    local title = "Recording Stopped"
+    if reason == "round" then
+        title = "End Of Round: Ready"
+    end
+    UI.notify(
+        title,
+        string.format("%d actions recorded. Select your macro under Record Macro to save them.", count),
+        8,
+        "check"
+    )
+    UI.showSaveDropdown()
+    UI.refreshStatus()
+end
+
+function Player.stop(reason)
+    if Player.running then
+        Debug.log("Playback stopped", tostring(reason))
+    end
+    Player.running = false
+    Player.token = Player.token + 1
+end
+
+function Player.waitUntil(deadline, token)
+    while os.clock() < deadline do
+        if token ~= Player.token or not Alive then
+            return false
+        end
+        task.wait(math.clamp(deadline - os.clock(), 0.03, 0.25))
+    end
+    return token == Player.token and Alive
+end
+
+function Player.newContext()
+    local ctx = {
+        towers = {},
+        positions = {},
+        claimed = setmetatable({}, {__mode = "k"}),
+    }
+    ctx.resolveTower = function(ref)
+        return Towers.resolveRef(ctx, ref)
+    end
+    return ctx
+end
+
+function Player.fire(remote, args)
+    Player.firing = true
+    local ok, err = pcall(function()
+        if remote:IsA("RemoteFunction") then
+            return remote:InvokeServer(table.unpack(args, 1, args.n))
+        end
+        return remote:FireServer(table.unpack(args, 1, args.n))
+    end)
+    Player.firing = false
+    if not ok then
+        Debug.log("Fire error", err)
+    end
+    return ok
+end
+
+function Player.confirmPlacement(pos, before, token)
+    local deadline = os.clock() + Config.PlaceConfirmTime
+    while os.clock() < deadline do
+        if token ~= Player.token then
+            return false
+        end
+        task.wait(0.2)
+        local verdict = Towers.appeared(pos, before)
+        if verdict ~= false then
+            return true
+        end
+    end
+    return false
+end
+
+function Player.resolveArgs(action, ctx, token)
+    local deadline = os.clock() + Config.ResolveTimeout
+    while true do
+        local args = Serializer.unpackArgs(action.args, ctx)
+        if args then
+            return args
+        end
+        if os.clock() >= deadline or token ~= Player.token then
+            return nil
+        end
+        task.wait(0.3)
+    end
+end
+
+function Player.execute(action, ctx, token)
+    local remote = Remotes.resolve(action)
+    if not remote then
+        Debug.log("Remote not found", tostring(action.remote))
+        return
+    end
+    if action.kind == "place" then
+        local pos = nil
+        if type(action.pos) == "table" and #action.pos == 3 then
+            pos = Vector3.new(action.pos[1], action.pos[2], action.pos[3])
+        end
+        if action.idx then
+            ctx.positions[action.idx] = pos
+        end
+        local args = Serializer.unpackArgs(action.args, ctx)
+        if not args then
+            return
+        end
+        for attempt = 1, Config.PlaceRetries do
+            if token ~= Player.token then
+                return
+            end
+            local before = {}
+            if pos then
+                before = Towers.snapshot(pos)
+            end
+            Player.fire(remote, args)
+            if not pos or Player.confirmPlacement(pos, before, token) then
+                return
+            end
+            Debug.log("Placement retry", tostring(action.unit), attempt)
+            if not Player.waitUntil(os.clock() + Config.PlaceRetryDelay, token) then
+                return
+            end
+        end
+        Debug.log("Placement failed", tostring(action.unit))
+        return
+    end
+    local args = Player.resolveArgs(action, ctx, token)
+    if not args then
+        Debug.log("Skipped " .. tostring(action.kind) .. ": tower not found")
+        return
+    end
+    Player.fire(remote, args)
+end
+
+function Player.start(name)
+    local macro = Macros.load(name)
+    if not macro or #macro.actions == 0 then
+        UI.notify("Playback", "That macro has no recorded actions.", 4, "alert-triangle")
+        return false
+    end
+    Player.stop("restart")
+    Player.running = true
+    Player.token = Player.token + 1
+    local token = Player.token
+    Player.name = name
+    Player.total = #macro.actions
+    Player.progress = 0
+    local ctx = Player.newContext()
+    UI.notify("Playback", "Running macro: " .. name, 3, "play")
+    task.spawn(function()
+        local origin = State.MatchStart or os.clock()
+        for index, action in ipairs(macro.actions) do
+            local due = origin + (tonumber(action.t) or 0)
+            if not Player.waitUntil(due, token) then
+                return
+            end
+            local ok, err = pcall(Player.execute, action, ctx, token)
+            if not ok then
+                Debug.log("Playback error", err)
+            end
+            Player.progress = index
+            if not Player.waitUntil(os.clock() + Config.MinActionGap, token) then
+                return
+            end
+        end
+        if token == Player.token then
+            Player.running = false
+            UI.notify("Playback", "Macro finished: " .. name, 4, "check")
+        end
+    end)
+    return true
+end
+
+function GuiWatch.accept(obj)
+    if not (obj:IsA("TextLabel") or obj:IsA("TextButton")) then
+        return
+    end
+    local screen = obj:FindFirstAncestorOfClass("ScreenGui")
+    if screen then
+        local lower = screen.Name:lower()
+        if lower:find("windui", 1, true) or lower:find("fluxhub", 1, true) then
+            return
+        end
+    end
+    GuiWatch.texts[obj] = true
+end
+
+function GuiWatch.init()
+    for _, descendant in ipairs(PlayerGui:GetDescendants()) do
+        GuiWatch.accept(descendant)
+    end
+    connect(PlayerGui.DescendantAdded, GuiWatch.accept)
+end
+
+function GuiTools.climb(obj)
+    if obj:IsA("GuiButton") then
+        return obj
+    end
+    local center = obj.AbsolutePosition + obj.AbsoluteSize / 2
+    local level = obj.Parent
+    local depth = 0
+    while level and level ~= PlayerGui and depth < 5 do
+        if level:IsA("GuiButton") and Util.guiVisible(level) then
+            return level
+        end
+        local best = nil
+        local bestArea = nil
+        for _, descendant in ipairs(level:GetDescendants()) do
+            if descendant:IsA("GuiButton") and Util.guiVisible(descendant) then
+                local p = descendant.AbsolutePosition
+                local s = descendant.AbsoluteSize
+                if center.X >= p.X and center.X <= p.X + s.X and center.Y >= p.Y and center.Y <= p.Y + s.Y then
+                    local area = s.X * s.Y
+                    if not bestArea or area < bestArea then
+                        best = descendant
+                        bestArea = area
+                    end
+                end
+            end
+        end
+        if best then
+            return best
+        end
+        level = level.Parent
+        depth = depth + 1
+    end
+    return nil
+end
+
+function GuiTools.click(button)
+    if not VirtualInputManager then
+        return false
+    end
+    local position = button.AbsolutePosition
+    local size = button.AbsoluteSize
+    local x = position.X + size.X / 2
+    local y = position.Y + size.Y / 2
+    local screen = button:FindFirstAncestorOfClass("ScreenGui")
+    if screen and not screen.IgnoreGuiInset then
+        local inset = GuiService:GetGuiInset()
+        y = y + inset.Y
+    end
+    local ok = pcall(function()
+        VirtualInputManager:SendMouseButtonEvent(x, y, 0, true, game, 1)
+        task.wait(0.05)
+        VirtualInputManager:SendMouseButtonEvent(x, y, 0, false, game, 1)
+    end)
+    return ok
+end
+
+function GuiTools.press(button)
+    if not button or not button:IsA("GuiButton") then
+        return false
+    end
+    local fired = false
+    if type(firesignal) == "function" then
+        for _, name in ipairs({"Activated", "MouseButton1Click"}) do
+            local ok = pcall(function()
+                firesignal(button[name])
+            end)
+            if ok then
+                fired = true
+            end
+        end
+    end
+    if not fired and type(getconnections) == "function" then
+        for _, name in ipairs({"Activated", "MouseButton1Click"}) do
+            local ok, connections = pcall(function()
+                return getconnections(button[name])
+            end)
+            if ok and type(connections) == "table" then
+                for _, connection in ipairs(connections) do
+                    pcall(function()
+                        if connection.Fire then
+                            connection:Fire()
+                        elseif connection.Function then
+                            connection.Function()
+                        end
+                    end)
+                    fired = true
+                end
+            end
+        end
+    end
+    if not fired then
+        fired = GuiTools.click(button)
+    end
+    return fired
+end
+
+function GuiTools.findByText(predicate)
+    for obj in pairs(GuiWatch.texts) do
+        if obj.Parent and obj.Text ~= "" and Util.guiVisible(obj) then
+            local text = Util.clean(obj.Text)
+            if text ~= "" and #text <= 32 and predicate(text) then
+                local button = GuiTools.climb(obj)
+                if button then
+                    return button
+                end
+            end
+        end
+    end
+    return nil
+end
+
+function Vote.find(selected)
+    local seen = {}
+    local seenCount = 0
+    local target = nil
+    for obj in pairs(GuiWatch.texts) do
+        if obj.Parent and obj.Text ~= "" and Util.guiVisible(obj) then
+            local text = Util.clean(obj.Text)
+            if text ~= "" and #text <= 32 then
+                for group, aliases in pairs(Config.DifficultyAliases) do
+                    for _, alias in ipairs(aliases) do
+                        if text:find("^" .. alias .. "%f[%A]") then
+                            if not seen[group] then
+                                seen[group] = true
+                                seenCount = seenCount + 1
+                            end
+                            if group == selected and not target then
+                                target = obj
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    if seenCount < 2 then
+        return nil, false
+    end
+    if not target then
+        return nil, true
+    end
+    return GuiTools.climb(target), true
+end
+
+function Detect.scan()
+    local result = {wave = nil, endHit = false}
+    for obj in pairs(GuiWatch.texts) do
+        if obj.Parent and obj.Text ~= "" and Util.guiVisible(obj) then
+            local text = Util.clean(obj.Text)
+            if text ~= "" and #text <= 48 then
+                local waveText = text:match("wave%s*:?%s*(%d+)")
+                if waveText then
+                    local number = tonumber(waveText)
+                    if number and (not result.wave or number > result.wave) then
+                        result.wave = number
+                    end
+                end
+                if not result.endHit then
+                    for _, title in ipairs(Config.EndTitles) do
+                        if text:match("^" .. title .. "[%s%p]*$") then
+                            result.endHit = true
+                            break
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return result
+end
+
+function Detect.onMatchBegin(startAt)
+    State.MatchStart = startAt or os.clock()
+    State.RoundEnded = false
+    State.ReplayPressed = false
+    State.EndShownSince = nil
+    State.PlayedThisMatch = false
+    Player.stop("new match")
+    if State.Armed then
+        Recorder.begin()
+    end
+    Debug.log("Match started")
+end
+
+function Detect.onRoundEnd()
+    Debug.log("Round ended")
+    Player.stop("round ended")
+    if State.Armed then
+        Recorder.finish("round")
+    end
+end
+
+function Detect.update()
+    local result = Detect.scan()
+    local now = os.clock()
+    local previousWave = State.Wave
+    State.Wave = result.wave or 0
+    State.EndVisible = result.endHit
+
+    local inMatchRaw = result.wave ~= nil or game.PlaceId ~= Config.LobbyPlaceId
+    if inMatchRaw then
+        State.LastMatchSeen = now
+        if not State.InMatch then
+            State.InMatch = true
+            State.SawMatch = true
+            Detect.onMatchBegin()
+        elseif result.wave ~= nil and previousWave >= 3 and result.wave <= 1 and not result.endHit then
+            Detect.onMatchBegin()
+        end
+    elseif State.InMatch and now - State.LastMatchSeen > 3 then
+        State.InMatch = false
+        State.SawMatch = false
+    end
+
+    if result.endHit then
+        State.EndClearSince = nil
+        if State.SawMatch and not State.RoundEnded then
+            State.RoundEnded = true
+            State.EndShownSince = now
+            Detect.onRoundEnd()
+        end
+    else
+        State.EndClearSince = State.EndClearSince or now
+        if State.RoundEnded and now - State.EndClearSince > 3 then
+            State.RoundEnded = false
+            State.EndShownSince = nil
+            State.ReplayPressed = false
+            if State.InMatch then
+                Detect.onMatchBegin(State.EndClearSince)
+            end
+        end
+    end
+end
+
+function Automation.tick()
+    local now = os.clock()
+    local data = Settings.data
+
+    if data.autoVote then
+        local button, voteVisible = Vote.find(data.difficulty)
+        if voteVisible then
+            State.VoteGoneSince = nil
+            if button and (not State.Voted or now - State.VoteAttemptAt > 6) then
+                State.VoteAttemptAt = now
+                if GuiTools.press(button) then
+                    State.Voted = true
+                    Debug.log("Voted", data.difficulty)
+                end
+            end
+        elseif State.Voted then
+            State.VoteGoneSince = State.VoteGoneSince or now
+            if now - State.VoteGoneSince > 3 then
+                State.Voted = false
+                State.VoteGoneSince = nil
+            end
+        end
+    end
+
+    if data.autoReplay and State.RoundEnded and State.EndVisible and not State.ReplayPressed then
+        if State.EndShownSince and now - State.EndShownSince >= 3 then
+            local button = GuiTools.findByText(function(text)
+                return text == "play again"
+            end)
+            if button and GuiTools.press(button) then
+                State.ReplayPressed = true
+                Debug.log("Replay pressed")
+            end
+        end
+    end
+
+    if data.autoSkip and State.InMatch and not State.RoundEnded and now - State.LastSkip > 3 then
+        local button = GuiTools.findByText(function(text)
+            return text:match("^skip") ~= nil
+        end)
+        if button then
+            State.LastSkip = now
+            GuiTools.press(button)
+        end
+    end
+
+    if data.playMacro and State.InMatch and not State.RoundEnded and not State.PlayedThisMatch and not Player.running then
+        if data.selectedMacro ~= "" then
+            State.PlayedThisMatch = true
+            Player.start(data.selectedMacro)
+        end
+    end
+end
+
+local InfoItems = {
+    {
+        "What is Cameraman Tower Defense?",
+        "A Roblox wave defense game by Aligators Games. You place Cameraman and Speakerman units along the route to stop invading toilets before they reach your base. Lobbies hold up to 30 players and each match fits 1 to 5 players.",
+    },
+    {
+        "How does a match start?",
+        "Step on a map platform in the lobby, vote for a difficulty, then the map loads and you place units from your hotbar. Survive every wave to earn coins.",
+    },
+    {
+        "Which difficulties exist?",
+        "Easy: 20 waves for 100 coins. Normal: 30 waves for 200 coins. Hard: 35 waves for 300 coins. Insane: 50 waves for 600 coins. This hub calls Insane by the name Nightmare.",
+    },
+    {
+        "Which currencies are there?",
+        "Coins are earned from wins and codes and buy summons in the lobby. Cash is earned during a match and resets every run. Gems come from quests that unlock after 20 wins.",
+    },
+    {
+        "How do I record a macro?",
+        "Open the Macros tab, type a name and press Create Macro. Turn on Record Macro and play the round normally. Every troop you place with its exact position, every upgrade and every sell is captured. When the round ends you get End Of Round: Ready and a list appears under Record Macro. Pick your macro there to save everything.",
+    },
+    {
+        "How does playback work?",
+        "Actions run at the same time offsets from the start of the match. Placements retry until the troop appears, and upgrades and sells are linked to the troop you placed at that spot. Use the same loadout, map and difficulty as the recording.",
+    },
+    {
+        "For best timing",
+        "Execute this script before the round starts and begin recording before the first troop is placed.",
+    },
+    {
+        "Nothing gets recorded, what now?",
+        "Open Settings, enable Log Remote Calls, place one troop and read the console to find the remote name. Type it into Remote Overrides. Your executor must support hookmetamethod.",
+    },
+    {
+        "Where are my files saved?",
+        "Inside the workspace folder of your executor, in FluxHub_CTD. Macros, the unsaved recording and your settings live there.",
+    },
+}
+
+function UI.notify(title, content, duration, icon)
+    if not UI.lib then
+        return
+    end
+    pcall(function()
+        UI.lib:Notify({
+            Title = title,
+            Content = content or "",
+            Duration = duration or 4,
+            Icon = icon or "info",
+        })
+    end)
+end
+
+function UI.add(container, method, config)
+    if not container then
+        return nil
+    end
+    local ok, result = pcall(function()
+        return container[method](container, config)
+    end)
+    if not ok then
+        Debug.log("UI error", method, tostring(result))
+        return nil
+    end
+    return result
+end
+
+function UI.header(container, title)
+    if not container then
+        return
+    end
+    pcall(function()
+        container:Section({Title = title})
+    end)
+end
+
+function UI.toggle(container, title, desc, value, callback)
+    return UI.add(container, "Toggle", {
+        Title = title,
+        Desc = desc,
+        Value = value,
+        Default = value,
+        Callback = function(state)
+            local ok, err = pcall(callback, state)
+            if not ok then
+                Debug.log("Toggle error", title, tostring(err))
+            end
+        end,
+    })
+end
+
+function UI.button(container, title, desc, callback)
+    return UI.add(container, "Button", {
+        Title = title,
+        Desc = desc,
+        Callback = function()
+            local ok, err = pcall(callback)
+            if not ok then
+                Debug.log("Button error", title, tostring(err))
+            end
+        end,
+    })
+end
+
+function UI.setDesc(key, text)
+    local element = UI[key]
+    if not element or UI.cache[key] == text then
+        return
+    end
+    UI.cache[key] = text
+    pcall(function()
+        element:SetDesc(text)
+    end)
+end
+
+function UI.macroValues()
+    local names = Macros.names()
+    if #names == 0 then
+        return {Config.NoMacros}
+    end
+    return names
+end
+
+function UI.refreshMacroLists()
+    local values = UI.macroValues()
+    if UI.macroDropdown then
+        pcall(function()
+            UI.macroDropdown:Refresh(values)
+        end)
+    end
+    if UI.saveDropdown then
+        pcall(function()
+            UI.saveDropdown:Refresh(values)
+        end)
+    end
+end
+
+function UI.setRecordToggle(value)
+    if UI.recordToggle then
+        pcall(function()
+            UI.recordToggle:Set(value)
+        end)
+    end
+end
+
+function UI.hideSaveDropdown()
+    if UI.saveDropdown then
+        local dropdown = UI.saveDropdown
+        UI.saveDropdown = nil
+        pcall(function()
+            dropdown:Destroy()
+        end)
+    end
+end
+
+function UI.onSaveSelected(value)
+    if type(value) == "table" then
+        value = value.Title or value[1]
+    end
+    if os.clock() - (UI.saveBornAt or 0) < 0.5 then
+        return
+    end
+    if type(value) ~= "string" or value == Config.NoMacros then
+        UI.notify("Save Macro", "Create a macro first, then select it here.", 5, "alert-triangle")
+        return
+    end
+    local pending = State.Pending
+    if not pending then
+        UI.notify("Save Macro", "There is no recording to save.", 4, "alert-triangle")
+        return
+    end
+    local count = Macros.save(value, pending)
+    if not count then
+        UI.notify("Save Macro", "Could not save the macro.", 4, "alert-triangle")
+        return
+    end
+    State.Pending = nil
+    Storage.remove(Paths.pending)
+    Settings.data.selectedMacro = value
+    Settings.save()
+    UI.hideSaveDropdown()
+    UI.notify("Macro Saved", string.format("%d actions saved to %s.", count, value), 5, "check")
+    UI.refreshStatus()
+end
+
+function UI.showSaveDropdown()
+    UI.hideSaveDropdown()
+    if not UI.recorderTab then
+        return
+    end
+    local count = State.Pending and #State.Pending.actions or 0
+    UI.saveBornAt = os.clock()
+    UI.saveDropdown = UI.add(UI.recorderTab, "Dropdown", {
+        Title = "Select Your Macro to Save all",
+        Desc = string.format("%d recorded actions are ready. Pick a macro to save them.", count),
+        Values = UI.macroValues(),
+        Callback = function(value)
+            local ok, err = pcall(UI.onSaveSelected, value)
+            if not ok then
+                Debug.log("Save error", tostring(err))
+            end
+        end,
+    })
+end
+
+function UI.onRecordToggle(state)
+    if state then
+        if State.Armed then
+            return
+        end
+        if not Hook.available then
+            UI.notify("Record Macro", "Your executor does not support hookmetamethod, so recording is unavailable.", 6, "alert-triangle")
+            UI.setRecordToggle(false)
+            return
+        end
+        UI.hideSaveDropdown()
+        Recorder.arm()
+        if State.Recording then
+            UI.notify("Record Macro", "Recording started. Play the round normally.", 4, "circle")
+        else
+            UI.notify("Record Macro", "Armed. Recording starts when the match begins.", 4, "circle")
+        end
+    else
+        if State.Armed then
+            Recorder.finish("manual")
+        end
+    end
+    UI.refreshStatus()
+end
+
+function UI.onCreate()
+    local name = Util.cleanName(UI.pendingName)
+    if name == "" or name == Config.NoMacros then
+        UI.notify("Create Macro", "Type a valid macro name first.", 4, "alert-triangle")
+        return
+    end
+    if Macros.exists(name) then
+        UI.notify("Create Macro", "A macro with that name already exists.", 4, "alert-triangle")
+        return
+    end
+    Macros.create(name)
+    Settings.data.selectedMacro = name
+    Settings.save()
+    UI.refreshMacroLists()
+    if UI.macroDropdown then
+        pcall(function()
+            UI.macroDropdown:Select(name)
+        end)
+    end
+    UI.notify("Macro Created", name .. " is ready. Turn on Record Macro to fill it.", 5, "check")
+end
+
+function UI.onDelete()
+    local name = Settings.data.selectedMacro
+    if name == "" then
+        UI.notify("Delete Macro", "Select a macro first.", 4, "alert-triangle")
+        return
+    end
+    local now = os.clock()
+    if UI.deleteArmed ~= name or now - (UI.deleteArmedAt or 0) > 5 then
+        UI.deleteArmed = name
+        UI.deleteArmedAt = now
+        UI.notify("Delete Macro", "Press Delete again within 5 seconds to remove " .. name .. ".", 5, "alert-triangle")
+        return
+    end
+    Macros.delete(name)
+    UI.deleteArmed = nil
+    Settings.data.selectedMacro = ""
+    Settings.save()
+    UI.refreshMacroLists()
+    UI.notify("Macro Deleted", name .. " was removed.", 4, "trash-2")
+end
+
+function UI.onPlayNow()
+    local name = Settings.data.selectedMacro
+    if name == "" then
+        UI.notify("Playback", "Select a macro first.", 4, "alert-triangle")
+        return
+    end
+    if not State.InMatch then
+        UI.notify("Playback", "Join a match first.", 4, "alert-triangle")
+        return
+    end
+    State.PlayedThisMatch = true
+    Player.start(name)
+end
+
+function UI.refreshStatus()
+    local counts = {place = 0, upgrade = 0, sell = 0}
+    for _, action in ipairs(Recorder.actions) do
+        counts[action.kind] = (counts[action.kind] or 0) + 1
+    end
+    local area = "Lobby"
+    if State.InMatch then
+        area = "Match"
+    end
+    local recording = "Off"
+    if State.Recording then
+        recording = "ON"
+    elseif State.Armed then
+        recording = "Armed, waiting for match"
+    end
+    local lines = {
+        string.format("Area: %s | Wave: %d | Recording: %s", area, State.Wave, recording),
+        string.format("Placed: %d | Upgraded: %d | Sold: %d", counts.place, counts.upgrade, counts.sell),
+    }
+    for _, line in ipairs(Recorder.recent) do
+        table.insert(lines, line)
+    end
+    if State.Pending then
+        table.insert(lines, string.format("Unsaved recording: %d actions", #State.Pending.actions))
+    end
+    UI.setDesc("recordStatus", table.concat(lines, "\n"))
+    local playback = "Idle"
+    if Player.running then
+        playback = string.format("Running %s: step %d of %d", tostring(Player.name), Player.progress, Player.total)
+    end
+    UI.setDesc("playStatus", playback)
+end
+
+function UI.loadLibrary()
+    local urls = {
+        "https://github.com/Footagesus/WindUI/releases/latest/download/main.lua",
+        "https://raw.githubusercontent.com/Footagesus/WindUI/main/dist/main.lua",
+    }
+    for _, url in ipairs(urls) do
+        local ok, library = pcall(function()
+            return loadstring(game:HttpGet(url))()
+        end)
+        if ok and type(library) == "table" then
+            return library
+        end
+    end
+    return nil
+end
+
+function UI.tab(title, icon)
+    local ok, tab = pcall(function()
+        return UI.window:Tab({Title = title, Icon = icon})
+    end)
+    if ok then
+        return tab
+    end
+    Debug.log("Tab error", title, tostring(tab))
+    return nil
+end
+
+function UI.build()
+    local library = UI.loadLibrary()
+    if not library then
+        warn("[Flux Hub - CTD] WindUI could not be loaded.")
+        return false
+    end
+    UI.lib = library
+    local ok, window = pcall(function()
+        return library:CreateWindow({
+            Title = Config.Name,
+            Icon = "camera",
+            Author = "Flux Hub",
+            Folder = Config.Folder,
+            Size = UDim2.fromOffset(540, 400),
+            Theme = "Dark",
+            Resizable = true,
+            SideBarWidth = 170,
+            HideSearchBar = true,
+        })
+    end)
+    if not ok or not window then
+        warn("[Flux Hub - CTD] The window could not be created.")
+        return false
+    end
+    UI.window = window
+    pcall(function()
+        window:EditOpenButton({
+            Title = Config.Name,
+            Icon = "camera",
+            CornerRadius = UDim.new(0, 16),
+            StrokeThickness = 2,
+            Color = ColorSequence.new(Color3.fromHex("FF0F7B"), Color3.fromHex("F89B29")),
+            Draggable = true,
+        })
+    end)
+
+    local macros = UI.tab("Macros", "video")
+    UI.recorderTab = macros
+    UI.header(macros, "Create Macro")
+    UI.add(macros, "Input", {
+        Title = "Macro Name",
+        Desc = "Type a name for your new macro.",
+        Placeholder = "My Macro",
+        Value = "",
+        Callback = function(text)
+            UI.pendingName = tostring(text or "")
+        end,
+    })
+    UI.button(macros, "Create Macro", "Creates an empty macro slot with that name.", UI.onCreate)
+    UI.header(macros, "Macro List")
+    local dropdownConfig = {
+        Title = "Select Macro",
+        Desc = "The macro used for playback and deletion.",
+        Values = UI.macroValues(),
+        Callback = function(value)
+            if type(value) == "table" then
+                value = value.Title or value[1]
+            end
+            if type(value) == "string" and value ~= Config.NoMacros then
+                Settings.data.selectedMacro = value
+            else
+                Settings.data.selectedMacro = ""
+            end
+            Settings.save()
+        end,
+    }
+    if Settings.data.selectedMacro ~= "" and Macros.exists(Settings.data.selectedMacro) then
+        dropdownConfig.Value = Settings.data.selectedMacro
+    end
+    UI.macroDropdown = UI.add(macros, "Dropdown", dropdownConfig)
+    UI.button(macros, "Delete Selected Macro", "Press twice to confirm.", UI.onDelete)
+    UI.button(macros, "Refresh Macro List", "Reloads the macro files.", function()
+        UI.refreshMacroLists()
+        UI.notify("Macros", "Macro list refreshed.", 3, "refresh-cw")
+    end)
+    UI.header(macros, "Record Macro")
+    UI.recordToggle = UI.toggle(
+        macros,
+        "Record Macro",
+        "Captures every troop you place with its position, every upgrade and every sell until the round ends.",
+        false,
+        UI.onRecordToggle
+    )
+    UI.recordStatus = UI.add(macros, "Paragraph", {
+        Title = "Recorder Status",
+        Desc = "Idle.",
+    })
+
+    local auto = UI.tab("Auto", "zap")
+    UI.header(auto, "Playback")
+    UI.toggle(auto, "Auto Play Selected Macro", "Starts the selected macro at the beginning of every match.", Settings.data.playMacro, function(state)
+        Settings.data.playMacro = state
+        Settings.save()
+    end)
+    UI.button(auto, "Play Selected Macro Now", "Runs the selected macro in the current match.", UI.onPlayNow)
+    UI.button(auto, "Stop Playback", "Cancels the macro that is running.", function()
+        Player.stop("manual")
+        UI.refreshStatus()
+    end)
+    UI.playStatus = UI.add(auto, "Paragraph", {
+        Title = "Playback Status",
+        Desc = "Idle",
+    })
+    UI.header(auto, "Match")
+    UI.toggle(auto, "Auto Select Difficulty", "Votes for the chosen difficulty when the vote screen appears.", Settings.data.autoVote, function(state)
+        Settings.data.autoVote = state
+        Settings.save()
+    end)
+    UI.add(auto, "Dropdown", {
+        Title = "Difficulty",
+        Desc = "Nightmare is the hardest mode, called Insane in the game.",
+        Values = Config.Difficulties,
+        Value = Settings.data.difficulty,
+        Callback = function(value)
+            if type(value) == "table" then
+                value = value.Title or value[1]
+            end
+            if type(value) == "string" then
+                Settings.data.difficulty = value
+                Settings.save()
+            end
+        end,
+    })
+    UI.toggle(auto, "Auto Replay", "Presses the replay button on the results screen.", Settings.data.autoReplay, function(state)
+        Settings.data.autoReplay = state
+        Settings.save()
+    end)
+    UI.toggle(auto, "Auto Skip Waves", "Presses the skip button whenever it is visible.", Settings.data.autoSkip, function(state)
+        Settings.data.autoSkip = state
+        Settings.save()
+    end)
+
+    local settings = UI.tab("Settings", "settings")
+    UI.toggle(settings, "Anti-AFK", "Prevents the idle disconnect.", Settings.data.antiAfk, function(state)
+        Settings.data.antiAfk = state
+        Settings.save()
+    end)
+    UI.toggle(settings, "Log Remote Calls", "Prints every remote call to the console so you can find the right remote names.", false, function(state)
+        Debug.logRemotes = state
+        Debug.verbose = state
+    end)
+    UI.header(settings, "Remote Overrides")
+    UI.add(settings, "Input", {
+        Title = "Place Remote Name",
+        Desc = "Exact remote name used to place a troop.",
+        Placeholder = "TowerAdd",
+        Value = Settings.data.overrides.place,
+        Callback = function(text)
+            Settings.data.overrides.place = tostring(text or "")
+            Settings.save()
+        end,
+    })
+    UI.add(settings, "Input", {
+        Title = "Upgrade Remote Name",
+        Desc = "Exact remote name used to upgrade a troop.",
+        Placeholder = "TowerUpgrade",
+        Value = Settings.data.overrides.upgrade,
+        Callback = function(text)
+            Settings.data.overrides.upgrade = tostring(text or "")
+            Settings.save()
+        end,
+    })
+    UI.add(settings, "Input", {
+        Title = "Sell Remote Name",
+        Desc = "Exact remote name used to sell a troop.",
+        Placeholder = "TowerSell",
+        Value = Settings.data.overrides.sell,
+        Callback = function(text)
+            Settings.data.overrides.sell = tostring(text or "")
+            Settings.save()
+        end,
+    })
+    UI.header(settings, "Tools")
+    UI.button(settings, "Scan Remotes", "Prints every remote in ReplicatedStorage to the console.", function()
+        local list = Remotes.list()
+        print("[Flux Hub - CTD] Remotes found: " .. #list .. "\n" .. table.concat(list, "\n"))
+        UI.notify("Scan Remotes", #list .. " remotes printed to the console.", 4, "search")
+    end)
+    UI.button(settings, "Copy Debug Log", "Copies the internal log to your clipboard.", function()
+        local text = table.concat(Debug.lines, "\n")
+        if type(setclipboard) == "function" then
+            setclipboard(text)
+            UI.notify("Debug Log", "Copied to clipboard.", 3, "clipboard")
+        else
+            print(text)
+            UI.notify("Debug Log", "Clipboard is unavailable, printed to the console.", 4, "info")
+        end
+    end)
+    UI.button(settings, "Unload Hub", "Closes the window and stops every feature.", function()
+        if Shared.destroy then
+            Shared.destroy()
+        end
+    end)
+
+    local info = UI.tab("Info", "info")
+    for _, item in ipairs(InfoItems) do
+        UI.add(info, "Paragraph", {Title = item[1], Desc = item[2]})
+    end
+
+    return true
+end
+
+function Hook.install()
+    if Shared.hookInstalled then
+        Hook.available = true
+        return true
+    end
+    if type(hookmetamethod) ~= "function" or type(getnamecallmethod) ~= "function" then
+        return false
+    end
+    local wrap = newcclosure
+    if type(wrap) ~= "function" then
+        wrap = function(callback)
+            return callback
+        end
+    end
+    local original
+    original = hookmetamethod(game, "__namecall", wrap(function(self, ...)
+        local method = getnamecallmethod()
+        if method == "FireServer" or method == "InvokeServer" then
+            local handler = Shared.handler
+            if handler then
+                pcall(handler, self, method, table.pack(...))
+            end
+        end
+        return original(self, ...)
+    end))
+    Shared.hookInstalled = true
+    Hook.available = true
+    return true
+end
+
+Storage.ensureFolder(Paths.root)
+Storage.ensureFolder(Paths.macros)
+Settings.load()
+
+Hook.install()
+
+Shared.handler = function(remote, method, args)
+    if not Alive or Player.firing then
+        return
+    end
+    if type(checkcaller) == "function" and checkcaller() then
+        return
+    end
+    if not (State.Recording or Debug.logRemotes) then
+        return
+    end
+    task.spawn(function()
+        local ok, err = pcall(Recorder.capture, remote, method, args)
+        if not ok then
+            Debug.log("Capture error", tostring(err))
+        end
+    end)
+end
+
+Shared.destroy = function()
+    Alive = false
+    State.Recording = false
+    State.Armed = false
+    Player.stop("unload")
+    Shared.handler = nil
+    for _, connection in ipairs(Connections) do
+        pcall(function()
+            connection:Disconnect()
+        end)
+    end
+    if UI.window then
+        pcall(function()
+            UI.window:Destroy()
+        end)
+    end
+end
+
+GuiWatch.init()
+
+if not UI.build() then
+    Shared.destroy()
+    return
+end
+
+connect(LocalPlayer.Idled, function()
+    if Settings.data.antiAfk then
+        pcall(function()
+            VirtualUser:CaptureController()
+            VirtualUser:ClickButton2(Vector2.new(0, 0))
+        end)
+    end
+end)
+
+local pendingRaw = Storage.read(Paths.pending)
+if pendingRaw then
+    local decoded = jsonDecode(pendingRaw)
+    if type(decoded) == "table" and type(decoded.actions) == "table" and #decoded.actions > 0 then
+        State.Pending = decoded
+        UI.showSaveDropdown()
+        UI.notify("Unsaved Recording", string.format("%d actions are waiting. Select a macro under Record Macro to save them.", #decoded.actions), 8, "alert-circle")
+    end
+end
+
+if Settings.data.recordArmed and Hook.available then
+    Recorder.arm()
+    UI.setRecordToggle(true)
+end
+
+task.spawn(function()
+    local lastStatus = 0
+    while Alive do
+        local ok, err = pcall(function()
+            Detect.update()
+            Automation.tick()
+            if os.clock() - lastStatus >= 1 then
+                lastStatus = os.clock()
+                UI.refreshStatus()
+            end
+        end)
+        if not ok then
+            Debug.log("Loop error", tostring(err))
+        end
+        task.wait(Config.ScanInterval)
+    end
+end)
+
+UI.refreshStatus()
+UI.notify(Config.Name, "Loaded. Open the Macros tab to create and record a macro.", 5, "camera")
